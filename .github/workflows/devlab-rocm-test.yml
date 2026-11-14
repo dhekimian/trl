@@ -1,0 +1,150 @@
+# Run TRL's test suite on real consumer AMD GPUs.
+#
+# TRL tests AMD on MI300 (tests_amd in tests.yml). This adds a Radeon 8060S
+# (Strix Halo, gfx1151) and a Radeon AI PRO R9700 (gfx1201): the same install
+# as tests_amd, torch for ROCm from download.pytorch.org, and a deterministic
+# sample of tests/ (tests/distributed needs two GPUs and is left out).
+#
+# Every run uploads summary-*.json (versions, device, pass/fail counts) so
+# results compare across torch/ROCm versions; other workflows call this one
+# for a version matrix (workflow_call).
+#
+# Runners: AMD DevLab, a donated pool of ephemeral, single-use machines. One
+# job per machine; nothing persists between jobs.
+name: ROCm test (gfx1151, gfx1201)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      torch_index_url:
+        description: Index torch comes from
+        default: https://download.pytorch.org/whl/rocm7.2
+      tests_per_file:
+        description: Test cases to run per test file
+        default: "40"
+  workflow_call:
+    inputs:
+      torch_spec: {type: string, default: "torch torchvision"}
+      torch_index_url: {type: string, default: https://download.pytorch.org/whl/rocm7.2}
+      tests_per_file: {type: string, default: "40"}
+      label: {type: string, default: release}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-test-${{ github.ref }}-${{ inputs.label || 'release' }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.gpu }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: strix-halo
+            gfx: gfx1151
+          - gpu: radeon-r9700
+            gfx: gfx1201
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
+    timeout-minutes: 90
+    env:
+      TORCH_SPEC: ${{ inputs.torch_spec || 'torch torchvision' }}
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm7.2' }}
+      PER_FILE: ${{ inputs.tests_per_file || '40' }}
+      LABEL: ${{ inputs.label || 'release' }}
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install torch and TRL
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          echo "torch: $spec from $TORCH_INDEX_URL"
+          pip install -q $spec --index-url "$TORCH_INDEX_URL"
+          pip install -q ".[dev]" pytest-timeout
+          python - <<'PY'
+          import json, torch, trl, transformers
+          assert torch.version.hip, "not a ROCm build of torch"
+          torch.cuda.init()
+          p = torch.cuda.get_device_properties(0)
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "trl": trl.__version__,
+                  "transformers": transformers.__version__}
+          print(info)
+          json.dump(info, open("env.json", "w"))
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          PY
+
+      - name: Tests (deterministic sample)
+        run: |
+          set -euo pipefail
+          . venv/bin/activate
+          python -m pytest tests --ignore=tests/distributed --collect-only -q -p no:cacheprovider \
+            2>/dev/null | grep '::' > all-tests.txt
+          python - "$PER_FILE" <<'PY' > sample.txt
+          import sys
+          from collections import defaultdict
+          per = int(sys.argv[1])
+          by_file = defaultdict(list)
+          for line in open("all-tests.txt"):
+              node = line.strip()
+              by_file[node.split("::")[0]].append(node)
+          for f, nodes in sorted(by_file.items()):
+              step = max(1, len(nodes) // per)
+              for n in nodes[::step][:per]:
+                  print(n)
+          PY
+          echo "running $(wc -l < sample.txt) of $(wc -l < all-tests.txt) collected cases"
+          # Workers capped: each imports torch and transformers, and the R9700
+          # VMs have 32 GB of host RAM (upstream's MI300 job runs 19).
+          python -m pytest -q -rf -p no:cacheprovider -n 4 --timeout=900 \
+            --junitxml=junit.xml $(cat sample.txt)
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, xml.etree.ElementTree as ET
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except Exception:
+                  return None
+          tests = None
+          if os.path.exists("junit.xml"):
+              s = ET.parse("junit.xml").getroot()
+              s = s if s.tag == "testsuite" else s.find("testsuite")
+              n = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+              tests = {"ran": n["tests"], "failed": n["failures"], "errors": n["errors"],
+                       "skipped": n["skipped"],
+                       "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
+                       "seconds": round(float(s.get("time", 0)), 1)}
+          env = load("env.json") or {}
+          summary = {
+              "schema": 1, "project": "trl", "label": os.environ["LABEL"],
+              "release": env.get("trl", ""), "combo": f"torch{env.get('torch', '?')}",
+              "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
+              "gfx": "${{ matrix.gfx }}", "env": env or None, "smoke": None, "tests": tests,
+              "job_status": "${{ job.status }}", "commit": "${{ github.sha }}",
+              "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+          }
+          json.dump(summary, open("summary.json", "w"), indent=1)
+          print(json.dumps(summary, indent=1))
+          PY
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-${{ inputs.label || 'release' }}-${{ matrix.gpu }}-${{ github.run_attempt }}
+          path: summary.json
+          retention-days: 90

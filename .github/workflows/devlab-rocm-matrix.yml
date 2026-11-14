@@ -1,0 +1,29 @@
+# DevLab support matrix for TRL: torch on each ROCm
+# line, plus AMD's next ROCm (TheRock pre-release), on Strix Halo
+# and the R9700. Weekly, in the DevLab fork only.
+name: DevLab support matrix
+
+on:
+  schedule:
+    - cron: "29 9 * * 1"        # Mondays 09:29 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {name: rocm10.0, spec: "torch torchvision", index: "https://download.pytorch.org/whl/rocm10.0"}
+          - {name: rocm7.2, spec: "torch torchvision", index: "https://download.pytorch.org/whl/rocm7.2"}
+          # TheRock pre-release: the next ROCm; {gfx} picks each job's chip package.
+          - {name: rocm-next, spec: "torch[device-{gfx}] torchvision", index: "https://rc.repo.amd.com/rocm/whl-next/"}
+    uses: ./.github/workflows/devlab-rocm-test.yml
+    with:
+      torch_spec: ${{ matrix.spec }}
+      torch_index_url: ${{ matrix.index }}
+      label: ${{ matrix.name }}
