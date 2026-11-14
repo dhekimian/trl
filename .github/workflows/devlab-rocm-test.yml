@@ -18,6 +18,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      no_hip_caching:
+        description: Run the tests with PYTORCH_NO_HIP_MEMORY_CACHING=1 (allocator experiment)
+        type: boolean
+        default: false
       torch_index_url:
         description: Index torch comes from
         default: https://download.pytorch.org/whl/rocm7.2
@@ -51,10 +55,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # workers: PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (upstream's MI300 job uses 19). Each worker
+          # imports torch + transformers and loads tiny models: about 2.5-3.5 GB resident at peak. The R9700 VMs
+          # have 32 GB of RAM: 6 workers leave ~10 GB for the OS, pip caches and the runner. Strix Halo has 128 GB
+          # shared between CPU and GPU: 8. The "Tests" step logs peak memory so these can be revisited.
           - gpu: strix-halo
             gfx: gfx1151
+            workers: 8
           - gpu: radeon-r9700
             gfx: gfx1201
+            workers: 6
     runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
     timeout-minutes: 90
     env:
@@ -176,14 +186,25 @@ jobs:
         run: |
           set -euo pipefail
           . venv/bin/activate
-          # Workers capped: each imports torch and transformers, and the R9700
-          # VMs have 32 GB of host RAM (upstream's MI300 job runs 19).
+          # Upstream's command (Makefile `test`, tests.yml tests_amd): -n auto --dist loadgroup -s -v, reruns for
+          # transient Hub/OOM errors. Ours adds the deterministic sample, tests/distributed left out (2 GPUs),
+          # junit for the judge, a per-test timeout and worker restarts after a GPU fault.
           # Test failures do not fail this step; "Judge results" decides, so a
           # known upstream failure can show as a warning instead.
+          export PYTEST_XDIST_AUTO_NUM_WORKERS="${{ matrix.workers }}"
+          # PYTORCH_NO_HIP_MEMORY_CACHING counts as set even when empty, so export it only when asked.
+          if [ "${{ inputs.no_hip_caching }}" = true ]; then export PYTORCH_NO_HIP_MEMORY_CACHING=1; echo "PYTORCH_NO_HIP_MEMORY_CACHING=1"; fi
+          # Peak memory, to size PYTEST_XDIST_AUTO_NUM_WORKERS.
+          ( peak=0; while sleep 5; do u=$(free -m | awk '/^Mem:/{print $3}'); [ "$u" -gt "$peak" ] && peak=$u && echo "$peak" > mem-peak.txt; done ) &
+          mem_pid=$!
           rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
-            python -m pytest tests --ignore=tests/distributed -p devlab_sample -q -rf \
-            -p no:cacheprovider -n 4 --max-worker-restart=16 --timeout=900 --junitxml=junit.xml || rc=$?
+            python -m pytest -n auto --dist loadgroup -s -v --reruns 5 --reruns-delay 1 \
+            --only-rerun '(OSError|Timeout|HTTPError.*502|HTTPError.*504|out of memory|STATUS_ALLOC_FAILED)' \
+            tests --ignore=tests/distributed -p devlab_sample -rf -p no:cacheprovider \
+            --max-worker-restart=16 --timeout=900 --junitxml=junit.xml || rc=$?
+          kill "$mem_pid" 2>/dev/null || true
+          echo "peak memory used: $(cat mem-peak.txt 2>/dev/null) MiB of $(free -m | awk '/^Mem:/{print $2}') MiB, ${PYTEST_XDIST_AUTO_NUM_WORKERS} workers"
           echo "$rc" > pytest-rc.txt
           echo "pytest exit code: $rc"
 
