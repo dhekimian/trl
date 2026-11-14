@@ -56,6 +56,7 @@ jobs:
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm7.2' }}
       PER_FILE: ${{ inputs.tests_per_file || '40' }}
       LABEL: ${{ inputs.label || 'release' }}
+      TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
@@ -67,8 +68,17 @@ jobs:
           . venv/bin/activate
           pip install -q --upgrade pip
           spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
-          echo "torch: $spec from $TORCH_INDEX_URL"
-          pip install -q $spec --index-url "$TORCH_INDEX_URL"
+          INDEX="$TORCH_INDEX_URL"
+          # A runner pool with a package mirror maps public indexes to it with the
+          # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
+          # Unset, the index is used as given.
+          if [ -n "${TORCH_INDEX_MAP:-}" ]; then
+            idx_in="$INDEX"
+            INDEX=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; print(m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)))' "$TORCH_INDEX_MAP" "$INDEX")
+            [ "$INDEX" = "$idx_in" ] || echo "torch index mapped: $idx_in -> $INDEX"
+          fi
+          echo "torch: $spec from $INDEX"
+          pip install -q $spec --index-url "$INDEX"
           pip install -q ".[dev]" pytest-timeout
           python - <<'PY'
           import json, torch, trl, transformers
