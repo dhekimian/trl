@@ -11,20 +11,23 @@ on:
       repeats:
         description: Runs of each test
         default: "10"
+      matrix:
+        description: Jobs (JSON list; f2, f2ctx, f3 pick the steps)
+        default: >-
+          [{"name": "rocm7.2", "index": "https://download.pytorch.org/whl/rocm7.2", "f2": true},
+          {"name": "rocm10.0", "index": "https://download.pytorch.org/whl/rocm10.0", "f2": true, "f3": true},
+          {"name": "rocm7.14", "index": "https://download.pytorch.org/whl/rocm7.14", "f3": true}]
 
 permissions:
   contents: read
 
 jobs:
   repro:
-    name: ${{ matrix.name }} (${{ matrix.gfx }})
+    name: ${{ matrix.name }} (gfx1201)
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {name: rocm7.2, gfx: gfx1201, index: "https://download.pytorch.org/whl/rocm7.2", f2: true, f3: false}
-          - {name: rocm10.0, gfx: gfx1201, index: "https://download.pytorch.org/whl/rocm10.0", f2: true, f3: true}
-          - {name: rocm7.14, gfx: gfx1201, index: "https://download.pytorch.org/whl/rocm7.14", f2: false, f3: true}
+        include: ${{ fromJSON(inputs.matrix) }}
     runs-on: [self-hosted, Linux, devlab-dispatch, radeon-r9700]
     timeout-minutes: 200
     env:
@@ -42,7 +45,7 @@ jobs:
           python3 -m venv venv
           . venv/bin/activate
           pip install -q --upgrade pip
-          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          spec="${TORCH_SPEC//\{gfx\}/gfx1201}"     # torch[device-{gfx}] for TheRock
           INDEX="$TORCH_INDEX_URL"
           # A runner pool with a package mirror maps public indexes to it with the
           # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
@@ -89,7 +92,7 @@ jobs:
                   "transformers": transformers.__version__}
           print(info)
           json.dump(info, open("env.json", "w"))
-          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          assert "gfx1201" in p.gcnArchName, f"expected gfx1201, got {p.gcnArchName}"
           PY
 
       - name: F2 - test_train_padding_free, repeated
@@ -106,6 +109,30 @@ jobs:
             else r="other(rc=$rc)"; fi
             echo "F2 run $i: $r" | tee -a results.txt
           done
+
+      - name: F2 - test_train_padding_free in context
+        if: matrix.f2ctx
+        run: |
+          # In isolation the test passes; in the full suite it faults. Run it among the other sampled DPO tests:
+          # a) one process, file order; b) four xdist workers on the one GPU, as in the suite;
+          # c) as (a) with kernels serialized, to name the kernel that faults.
+          . venv/bin/activate
+          mkdir -p logs
+          export PYTHONPATH="$RUNNER_TEMP/sampler" DEVLAB_PER=40 DEVLAB_GROUP=file
+          mkdir -p "$PYTHONPATH"
+          sed -n '/^          import os$/,/^          PY$/p' .github/workflows/devlab-rocm-test.yml | sed '$d; s/^          //' > "$PYTHONPATH/devlab_sample.py"
+          run() {  # name, extra pytest args...
+            local name=$1; shift; local rc=0
+            timeout 2400 python -m pytest tests/test_dpo_trainer.py -p devlab_sample -q -rf -p no:cacheprovider \
+              --timeout=600 "$@" > "logs/f2ctx-$name.log" 2>&1 || rc=$?
+            local t
+            if grep -qE 'FAILED .*test_train_padding_free|ERROR .*test_train_padding_free' "logs/f2ctx-$name.log"; then t="padding_free FAILED"; else t="padding_free ok"; fi
+            echo "F2 context $name: $t; faults: $(grep -cE 'illegal memory access was encountered$' "logs/f2ctx-$name.log"); first: $(grep -m1 -E '^(FAILED|ERROR) ' "logs/f2ctx-$name.log" | cut -c1-120); $(grep -E '[0-9]+ (passed|failed)' "logs/f2ctx-$name.log" | tail -1)" | tee -a results.txt
+            grep -m3 -E 'Memory Fault|kernel: ' "logs/f2ctx-$name.log" | cut -c1-300 || true
+          }
+          for i in 1 2 3; do run "single-$i" -p no:xdist; done
+          for i in 1 2 3; do run "xdist4-$i" -n 4; done
+          AMD_SERIALIZE_KERNEL=3 run serialized -p no:xdist
 
       - name: F3 - standalone GEMM sweep and model scripts
         if: matrix.f3
@@ -144,13 +171,13 @@ jobs:
         if: always()
         run: |
           cat results.txt 2>/dev/null || echo "no results"
-          { echo "### ${{ matrix.name }} on ${{ matrix.gfx }}"; echo '```'; cat results.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### ${{ matrix.name }} on gfx1201"; echo '```'; cat results.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
           import json, os, datetime
           env = json.load(open("env.json")) if os.path.exists("env.json") else {}
           lines = open("results.txt").read().splitlines() if os.path.exists("results.txt") else []
           json.dump({"schema": 1, "project": "trl", "label": "repro-${{ matrix.name }}", "release": env.get("trl", ""),
-                     "combo": f"torch{env.get('torch', '?')}", "gpu": "radeon-r9700", "gfx": "${{ matrix.gfx }}",
+                     "combo": f"torch{env.get('torch', '?')}", "gpu": "radeon-r9700", "gfx": "gfx1201",
                      "env": env or None, "smoke": None, "tests": None, "repro": lines,
                      "job_status": "${{ job.status }}", "commit": "${{ github.sha }}",
                      "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
