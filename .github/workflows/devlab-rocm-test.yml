@@ -107,7 +107,9 @@ jobs:
             [ "$INDEX" = "$idx_in" ] || echo "torch index mapped: $idx_in -> $INDEX"
           fi
           echo "torch: $spec from $INDEX"
-          pip install -q $spec --index-url "$INDEX"
+          # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an extra
+          # index, and PyPI's newer CUDA torch would then win over the ROCm one.
+          PIP_CONFIG_FILE=/dev/null pip install -q $spec --index-url "$INDEX"
           # Pin the torch stack for every later pip call: a package that depends on
           # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
           # and the tests run on the CPU.
