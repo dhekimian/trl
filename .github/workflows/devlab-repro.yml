@@ -1,0 +1,170 @@
+# Repeat runs of two GPU faults on the R9700 (gfx1201), to measure how often they happen and whether a
+# standalone script reproduces them. Manual only; one job per torch build.
+#   F2: TestDPOTrainer::test_train_padding_free (aiter-flash-attn) faults with torch 2.14.1+rocm7.2.
+#   F3: a hipBLASLt bf16 GEMM faults in TestAsyncGRPOTrainerVLM::test_train_vlm_text_only_data[Qwen3.5-MoE]
+#       with torch 2.15.0+rocm7.14 and +rocm10.0.
+name: DevLab repro (gfx1201)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Runs of each test
+        default: "10"
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.name }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: rocm7.2, gfx: gfx1201, index: "https://download.pytorch.org/whl/rocm7.2", f2: true, f3: false}
+          - {name: rocm10.0, gfx: gfx1201, index: "https://download.pytorch.org/whl/rocm10.0", f2: true, f3: true}
+          - {name: rocm7.14, gfx: gfx1201, index: "https://download.pytorch.org/whl/rocm7.14", f2: false, f3: true}
+    runs-on: [self-hosted, Linux, devlab-dispatch, radeon-r9700]
+    timeout-minutes: 200
+    env:
+      TORCH_SPEC: torch torchvision
+      TORCH_INDEX_URL: ${{ matrix.index }}
+      TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
+      REPEATS: ${{ inputs.repeats || '10' }}
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install torch and TRL
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          INDEX="$TORCH_INDEX_URL"
+          # A runner pool with a package mirror maps public indexes to it with the
+          # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
+          # Unset, the index is used as given.
+          EXTRA=()
+          if [ -n "${TORCH_INDEX_MAP:-}" ]; then
+            idx_in="$INDEX"
+            # A value is a mirror URL, or a list [index, extra index, ...] when the
+            # mirror serves the index's packages from more than one repository.
+            idx=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; v=m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)); print("\n".join([v] if isinstance(v, str) else v))' "$TORCH_INDEX_MAP" "$INDEX")
+            mapfile -t idx <<<"$idx"
+            INDEX="${idx[0]}"
+            for e in "${idx[@]:1}"; do EXTRA+=(--extra-index-url "$e"); done
+            [ "$INDEX" = "$idx_in" ] && [ ${#idx[@]} -eq 1 ] || echo "torch index mapped: $idx_in -> $INDEX${EXTRA:+ (extra: ${idx[*]:1})}"
+          fi
+          echo "torch: $spec from $INDEX"
+          # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an extra
+          # index, and PyPI's newer CUDA torch would then win over the ROCm one.
+          PIP_CONFIG_FILE=/dev/null pip install -q $spec --index-url "$INDEX" "${EXTRA[@]}"
+          # Pin the torch stack for every later pip call: a package that depends on
+          # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
+          # and the tests run on the CPU.
+          pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|pytorch-triton-rocm|rocm[a-z0-9_-]*)==' \
+            > "$RUNNER_TEMP/torch-pin.txt"
+          cat "$RUNNER_TEMP/torch-pin.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
+          echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
+          pip install -q ".[dev]" pytest-timeout
+          # A host-wide Hugging Face cache this job cannot write (left by another
+          # user) fails every download; fall back to a job-local cache.
+          hub=$(python -c 'from huggingface_hub import constants as c; print(c.HF_HUB_CACHE)')
+          if [ -e "$hub" ] && [ -n "$(find "$hub" -maxdepth 2 ! -writable -print -quit 2>/dev/null)" ]; then
+            echo "::warning::Hugging Face cache $hub is not writable; using a job-local cache"
+            echo "HF_HOME=$RUNNER_TEMP/hf" >> "$GITHUB_ENV"
+            echo "HF_HUB_CACHE=$RUNNER_TEMP/hf/hub" >> "$GITHUB_ENV"
+          fi
+          python - <<'PY'
+          import json, torch, trl, transformers
+          assert torch.version.hip, "not a ROCm build of torch"
+          torch.cuda.init()
+          p = torch.cuda.get_device_properties(0)
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "trl": trl.__version__,
+                  "transformers": transformers.__version__}
+          print(info)
+          json.dump(info, open("env.json", "w"))
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          PY
+
+      - name: F2 - test_train_padding_free, repeated
+        if: matrix.f2
+        run: |
+          . venv/bin/activate
+          mkdir -p logs
+          for i in $(seq "$REPEATS"); do
+            rc=0; timeout 900 python -m pytest "tests/test_dpo_trainer.py::TestDPOTrainer::test_train_padding_free" \
+              -q -p no:cacheprovider --timeout=600 > "logs/f2-$i.log" 2>&1 || rc=$?
+            if grep -qE 'illegal memory access|Memory Fault|Memory access fault' "logs/f2-$i.log"; then r=fault
+            elif grep -qE '^1 passed' "logs/f2-$i.log"; then r=pass
+            elif grep -qE ' skipped' "logs/f2-$i.log"; then r=skipped
+            else r="other(rc=$rc)"; fi
+            echo "F2 run $i: $r" | tee -a results.txt
+          done
+
+      - name: F3 - standalone GEMM sweep and model scripts
+        if: matrix.f3
+        run: |
+          . venv/bin/activate
+          mkdir -p logs
+          for mode in gemm generate concurrent; do
+            rc=0; timeout 1200 python -u .github/devlab-repro-gemm.py "$mode" > "logs/f3-$mode.log" 2>&1 || rc=$?
+            if grep -qE 'illegal memory access|Memory Fault|Memory access fault' "logs/f3-$mode.log"; then r=fault
+            elif [ "$rc" = 0 ]; then r="no fault"
+            else r="other(rc=$rc)"; fi
+            echo "F3 script $mode: $r; last case: $(grep -E '^(case|generate|concurrent)' "logs/f3-$mode.log" | tail -1)" | tee -a results.txt
+            grep -m2 -E 'Memory Fault|illegal memory access' "logs/f3-$mode.log" | cut -c1-400 || true
+          done
+
+      - name: F3 - VLM test, repeated
+        if: matrix.f3
+        run: |
+          . venv/bin/activate
+          mkdir -p logs
+          id='tests/test_async_grpo_trainer.py::TestAsyncGRPOTrainerVLM::test_train_vlm_text_only_data[trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6]'
+          for i in $(seq "$REPEATS"); do
+            start=$SECONDS
+            rc=0; timeout 900 python -m pytest "$id" -q -p no:cacheprovider --timeout=600 > "logs/f3-vlm-$i.log" 2>&1 || rc=$?
+            if grep -qE 'Memory Fault|illegal memory access' "logs/f3-vlm-$i.log"; then
+              r="fault ($(grep -m1 -oE 'kernel: [A-Za-z0-9_]{0,40}' "logs/f3-vlm-$i.log" || echo 'no kernel name'))"
+            elif grep -q 'Got tf32' "logs/f3-vlm-$i.log"; then r="no fault (tf32 error only)"
+            else r="other(rc=$rc)"; fi
+            echo "F3 VLM run $i: $r, $((SECONDS - start)) s" | tee -a results.txt
+            # Keep the head and tail only: a faulting run logs hundreds of thousands of lines.
+            { head -c 300000 "logs/f3-vlm-$i.log"; echo; echo '[...]'; tail -c 300000 "logs/f3-vlm-$i.log"; } > "logs/f3-vlm-$i.trim" \
+              && mv "logs/f3-vlm-$i.trim" "logs/f3-vlm-$i.log"
+          done
+
+      - name: Results
+        if: always()
+        run: |
+          cat results.txt 2>/dev/null || echo "no results"
+          { echo "### ${{ matrix.name }} on ${{ matrix.gfx }}"; echo '```'; cat results.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json, os, datetime
+          env = json.load(open("env.json")) if os.path.exists("env.json") else {}
+          lines = open("results.txt").read().splitlines() if os.path.exists("results.txt") else []
+          json.dump({"schema": 1, "project": "trl", "label": "repro-${{ matrix.name }}", "release": env.get("trl", ""),
+                     "combo": f"torch{env.get('torch', '?')}", "gpu": "radeon-r9700", "gfx": "${{ matrix.gfx }}",
+                     "env": env or None, "smoke": None, "tests": None, "repro": lines,
+                     "job_status": "${{ job.status }}", "commit": "${{ github.sha }}",
+                     "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                     "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
+                    open("summary.json", "w"), indent=1)
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-repro-${{ matrix.name }}-${{ github.run_attempt }}
+          path: |
+            summary.json
+            results.txt
+            logs/
+          retention-days: 30
