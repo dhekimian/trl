@@ -101,15 +101,21 @@ jobs:
           # A runner pool with a package mirror maps public indexes to it with the
           # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
           # Unset, the index is used as given.
+          EXTRA=()
           if [ -n "${TORCH_INDEX_MAP:-}" ]; then
             idx_in="$INDEX"
-            INDEX=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; print(m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)))' "$TORCH_INDEX_MAP" "$INDEX")
-            [ "$INDEX" = "$idx_in" ] || echo "torch index mapped: $idx_in -> $INDEX"
+            # A value is a mirror URL, or a list [index, extra index, ...] when the
+            # mirror serves the index's packages from more than one repository.
+            idx=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; v=m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)); print("\n".join([v] if isinstance(v, str) else v))' "$TORCH_INDEX_MAP" "$INDEX")
+            mapfile -t idx <<<"$idx"
+            INDEX="${idx[0]}"
+            for e in "${idx[@]:1}"; do EXTRA+=(--extra-index-url "$e"); done
+            [ "$INDEX" = "$idx_in" ] && [ ${#idx[@]} -eq 1 ] || echo "torch index mapped: $idx_in -> $INDEX${EXTRA:+ (extra: ${idx[*]:1})}"
           fi
           echo "torch: $spec from $INDEX"
           # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an extra
           # index, and PyPI's newer CUDA torch would then win over the ROCm one.
-          PIP_CONFIG_FILE=/dev/null pip install -q $spec --index-url "$INDEX"
+          PIP_CONFIG_FILE=/dev/null pip install -q $spec --index-url "$INDEX" "${EXTRA[@]}"
           # Pin the torch stack for every later pip call: a package that depends on
           # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
           # and the tests run on the CPU.
