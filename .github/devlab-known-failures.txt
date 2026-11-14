@@ -5,8 +5,12 @@
 
 # trl/kernels/tree_gated_delta_rule.py hardcodes tf32 for tl.dot; Triton's HIP backend on RDNA (gfx1151, gfx1201) only accepts ieee/bf16x3/bf16x6.
 tests/test_async_grpo_trainer.py::TestTreePackingParity::test_loss_and_grads_match_each_sample_alone*gdn* | tree gated-delta-rule kernel uses tf32 dot precision, unsupported by Triton on RDNA | not filed
+# On gfx1201 with PyTorch's rocm7.14 and rocm10.0 wheels (torch 2.15.0) this test ALSO hits a GPU memory fault in a
+# hipBLASLt bf16 GEMM+bias kernel (Cijk_Ailk_Bljk_BBS_BH_Bias_..._MI16x16x1) inside the test's generation server,
+# before the tf32 error is reached. Same node id, so this entry covers both; see the findings for the GEMM fault.
 tests/test_async_grpo_trainer.py::TestAsyncGRPOTrainerVLM::test_train_vlm_text_only_data*Qwen3_5Moe* | tree gated-delta-rule kernel uses tf32 dot precision, unsupported by Triton on RDNA | not filed
 
-# The test picks kernels-community/aiter-flash-attn@v2 for any ROCm device; on gfx1201 that kernel faults
-# (illegal memory access) during training. It passes on gfx1151.
-tests/test_dpo_trainer.py::TestDPOTrainer::test_train_padding_free | aiter-flash-attn hub kernel faults (illegal memory access) on gfx1201 | not filed
+# The test picks kernels-community/aiter-flash-attn@v2 for any ROCm device; with PyTorch's torch 2.14.1+rocm7.2
+# on gfx1201 that kernel faults (illegal memory access) during training. It passes on gfx1151, and on gfx1201
+# with the rocm7.14, rocm10.0, AMD rocm10.1 and rocm-next torch builds.
+tests/test_dpo_trainer.py::TestDPOTrainer::test_train_padding_free | aiter-flash-attn hub kernel faults (illegal memory access) on gfx1201 with torch 2.14.1+rocm7.2 | not filed
