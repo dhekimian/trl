@@ -24,6 +24,12 @@ on:
       tests_per_file:
         description: Test cases to run per test file
         default: "40"
+      torch_spec:
+        description: torch packages ({gfx} becomes the job's chip)
+        default: "torch torchvision"
+      label:
+        description: Name for this combination (summary and concurrency)
+        default: release
   workflow_call:
     inputs:
       torch_spec: {type: string, default: "torch torchvision"}
