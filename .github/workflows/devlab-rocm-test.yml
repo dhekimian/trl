@@ -172,9 +172,70 @@ jobs:
           . venv/bin/activate
           # Workers capped: each imports torch and transformers, and the R9700
           # VMs have 32 GB of host RAM (upstream's MI300 job runs 19).
+          # Test failures do not fail this step; "Judge results" decides, so a
+          # known upstream failure can show as a warning instead.
+          rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
             python -m pytest tests --ignore=tests/distributed -p devlab_sample -q -rf \
-            -p no:cacheprovider -n 4 --max-worker-restart=16 --timeout=900 --junitxml=junit.xml
+            -p no:cacheprovider -n 4 --max-worker-restart=16 --timeout=900 --junitxml=junit.xml || rc=$?
+          echo "$rc" > pytest-rc.txt
+          echo "pytest exit code: $rc"
+
+      - name: Judge results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          # Red only for a new failure or a broken setup. A failure matching
+          # .github/devlab-known-failures.txt (classified upstream) is a warning.
+          import fnmatch, json, os, sys, xml.etree.ElementTree as ET
+          known = []
+          if os.path.exists(".github/devlab-known-failures.txt"):
+              for line in open(".github/devlab-known-failures.txt"):
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      pat, reason, issue = ([f.strip() for f in line.split("|")] + ["", ""])[:3]
+                      known.append((pat, reason, issue))
+          def nodeid(classname, name):
+              parts = classname.split(".")
+              for i in range(len(parts), 0, -1):
+                  path = "/".join(parts[:i]) + ".py"
+                  if os.path.exists(path):
+                      return "::".join([path] + parts[i:] + [name])
+              return "::".join(parts + [name])
+          rc = open("pytest-rc.txt").read().strip() if os.path.exists("pytest-rc.txt") else None
+          failed, broken = [], None
+          if rc is None or not os.path.exists("junit.xml"):
+              broken = "the tests did not run (install or setup failed)"
+          elif rc not in ("0", "1"):
+              broken = f"pytest exited with {rc} (interrupted, internal error or nothing collected)"
+          else:
+              for case in ET.parse("junit.xml").getroot().iter("testcase"):
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      i = nodeid(case.get("classname", ""), case.get("name", ""))
+                      if i not in failed:
+                          failed.append(i)
+          known_ids, new_ids, lines = [], [], []
+          for i in failed:
+              hit = next((k for k in known if fnmatch.fnmatchcase(i, k[0])), None)
+              if hit:
+                  known_ids.append(i)
+                  print(f"::warning title=Known upstream failure::{i} — {hit[1]} ({hit[2]})")
+                  lines.append(f"- :warning: known upstream: `{i}` — {hit[1]} ({hit[2]})")
+              else:
+                  new_ids.append(i)
+                  print(f"::error title=New failure::{i}")
+                  lines.append(f"- :x: new failure: `{i}`")
+          if broken:
+              print(f"::error title=Tests did not run::{broken}")
+              lines.insert(0, f"- :x: {broken}")
+          verdict = "fail" if broken or new_ids else ("known-failures" if known_ids else "pass")
+          json.dump({"verdict": verdict, "known_failures": known_ids, "new_failures": new_ids},
+                    open("verdict.json", "w"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### ${{ matrix.gpu }} (${{ matrix.gfx }}): {verdict}\n" + "\n".join(lines) + "\n")
+          print(f"verdict: {verdict} ({len(known_ids)} known, {len(new_ids)} new)")
+          sys.exit(1 if verdict == "fail" else 0)
+          PY
 
       - name: Write the run summary
         if: always()
@@ -196,11 +257,14 @@ jobs:
                        "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
                        "seconds": round(float(s.get("time", 0)), 1)}
           env = load("env.json") or {}
+          judged = load("verdict.json") or {"verdict": "fail", "known_failures": [], "new_failures": []}
           summary = {
               "schema": 1, "project": "trl", "label": os.environ["LABEL"],
               "release": env.get("trl", ""), "combo": f"torch{env.get('torch', '?')}",
               "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
               "gfx": "${{ matrix.gfx }}", "env": env or None, "smoke": None, "tests": tests,
+              "verdict": judged["verdict"], "known_failures": judged["known_failures"],
+              "new_failures": judged["new_failures"],
               "job_status": "${{ job.status }}", "commit": "${{ github.sha }}",
               "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

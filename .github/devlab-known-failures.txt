@@ -1,0 +1,12 @@
+# Known upstream failures on DevLab GPUs: these show as warnings, not red.
+# One entry per line: <fnmatch pattern on the pytest node id> | <reason> | <upstream issue URL, or "not filed">
+# fnmatch treats [ ] as a character class: match parametrized ids with * instead of brackets.
+# List a failure here only once it is classified as upstream (trl, transformers, a kernel, or ROCm torch).
+
+# trl/kernels/tree_gated_delta_rule.py hardcodes tf32 for tl.dot; Triton's HIP backend on RDNA (gfx1151, gfx1201) only accepts ieee/bf16x3/bf16x6.
+tests/test_async_grpo_trainer.py::TestTreePackingParity::test_loss_and_grads_match_each_sample_alone*gdn* | tree gated-delta-rule kernel uses tf32 dot precision, unsupported by Triton on RDNA | not filed
+tests/test_async_grpo_trainer.py::TestAsyncGRPOTrainerVLM::test_train_vlm_text_only_data*Qwen3_5Moe* | tree gated-delta-rule kernel uses tf32 dot precision, unsupported by Triton on RDNA | not filed
+
+# The test picks kernels-community/aiter-flash-attn@v2 for any ROCm device; on gfx1201 that kernel faults
+# (illegal memory access) during training. It passes on gfx1151.
+tests/test_dpo_trainer.py::TestDPOTrainer::test_train_padding_free | aiter-flash-attn hub kernel faults (illegal memory access) on gfx1201 | not filed
