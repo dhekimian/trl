@@ -58,8 +58,37 @@ jobs:
       LABEL: ${{ inputs.label || 'release' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       OMP_NUM_THREADS: "1"
+      SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
     steps:
       - uses: actions/checkout@v4
+
+      - name: Write the test sampler
+        run: |
+          # A pytest plugin that keeps a deterministic sample at collection time:
+          # every pytest-xdist worker selects the same tests, and node ids never
+          # pass through the shell.
+          mkdir -p "$SAMPLER_DIR"
+          cat > "$SAMPLER_DIR/devlab_sample.py" <<'PY'
+          import os
+          from collections import defaultdict
+
+
+          def pytest_collection_modifyitems(config, items):
+              per = int(os.environ.get("DEVLAB_PER") or 0)
+              if per <= 0:
+                  return
+              by_file = os.environ.get("DEVLAB_GROUP", "function") == "file"
+              groups = defaultdict(list)
+              for item in items:
+                  nodeid = item.nodeid
+                  groups[nodeid.split("::")[0] if by_file else nodeid.split("[")[0]].append(item)
+              keep = set()
+              for members in groups.values():
+                  step = max(1, len(members) // per)
+                  keep.update(id(i) for i in members[::step][:per])
+              config.hook.pytest_deselected(items=[i for i in items if id(i) not in keep])
+              items[:] = [i for i in items if id(i) in keep]
+          PY
 
       - name: Install torch and TRL
         run: |
@@ -79,6 +108,14 @@ jobs:
           fi
           echo "torch: $spec from $INDEX"
           pip install -q $spec --index-url "$INDEX"
+          # Pin the torch stack for every later pip call: a package that depends on
+          # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
+          # and the tests run on the CPU.
+          pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|pytorch-triton-rocm|rocm[a-z0-9_-]*)==' \
+            > "$RUNNER_TEMP/torch-pin.txt"
+          cat "$RUNNER_TEMP/torch-pin.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
+          echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
           pip install -q ".[dev]" pytest-timeout
           python - <<'PY'
           import json, torch, trl, transformers
@@ -97,26 +134,11 @@ jobs:
         run: |
           set -euo pipefail
           . venv/bin/activate
-          python -m pytest tests --ignore=tests/distributed --collect-only -q -p no:cacheprovider \
-            2>/dev/null | grep '::' > all-tests.txt
-          python - "$PER_FILE" <<'PY' > sample.txt
-          import sys
-          from collections import defaultdict
-          per = int(sys.argv[1])
-          by_file = defaultdict(list)
-          for line in open("all-tests.txt"):
-              node = line.strip()
-              by_file[node.split("::")[0]].append(node)
-          for f, nodes in sorted(by_file.items()):
-              step = max(1, len(nodes) // per)
-              for n in nodes[::step][:per]:
-                  print(n)
-          PY
-          echo "running $(wc -l < sample.txt) of $(wc -l < all-tests.txt) collected cases"
           # Workers capped: each imports torch and transformers, and the R9700
           # VMs have 32 GB of host RAM (upstream's MI300 job runs 19).
-          python -m pytest -q -rf -p no:cacheprovider -n 4 --timeout=900 \
-            --junitxml=junit.xml $(cat sample.txt)
+          PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
+            python -m pytest tests --ignore=tests/distributed -p devlab_sample -q -rf \
+            -p no:cacheprovider -n 4 --timeout=900 --junitxml=junit.xml
 
       - name: Write the run summary
         if: always()
