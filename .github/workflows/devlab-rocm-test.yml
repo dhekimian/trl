@@ -70,7 +70,10 @@ jobs:
           mkdir -p "$SAMPLER_DIR"
           cat > "$SAMPLER_DIR/devlab_sample.py" <<'PY'
           import os
+          import sys
           from collections import defaultdict
+
+          import pytest
 
 
           def pytest_collection_modifyitems(config, items):
@@ -88,6 +91,23 @@ jobs:
                   keep.update(id(i) for i in members[::step][:per])
               config.hook.pytest_deselected(items=[i for i in items if id(i) not in keep])
               items[:] = [i for i in items if id(i) in keep]
+
+
+          @pytest.hookimpl(wrapper=True, trylast=True)
+          def pytest_runtest_protocol(item, nextitem):
+              # A GPU fault (e.g. an illegal memory access) poisons the process's
+              # HIP context, and every later test on that xdist worker fails with
+              # it. Exit the worker instead; xdist reports the test and restarts it.
+              result = yield
+              torch = sys.modules.get("torch")
+              if os.environ.get("PYTEST_XDIST_WORKER") and torch is not None and torch.cuda.is_initialized():
+                  try:
+                      torch.cuda.synchronize()
+                  except Exception as exc:
+                      sys.stderr.write(f"devlab: GPU context lost after {item.nodeid}: {exc}\n")
+                      sys.stderr.flush()
+                      os._exit(3)
+              return result
           PY
 
       - name: Install torch and TRL
@@ -125,6 +145,14 @@ jobs:
           export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
           echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
           pip install -q ".[dev]" pytest-timeout
+          # A host-wide Hugging Face cache this job cannot write (left by another
+          # user) fails every download; fall back to a job-local cache.
+          hub=$(python -c 'from huggingface_hub import constants as c; print(c.HF_HUB_CACHE)')
+          if [ -e "$hub" ] && [ -n "$(find "$hub" -maxdepth 2 ! -writable -print -quit 2>/dev/null)" ]; then
+            echo "::warning::Hugging Face cache $hub is not writable; using a job-local cache"
+            echo "HF_HOME=$RUNNER_TEMP/hf" >> "$GITHUB_ENV"
+            echo "HF_HUB_CACHE=$RUNNER_TEMP/hf/hub" >> "$GITHUB_ENV"
+          fi
           python - <<'PY'
           import json, torch, trl, transformers
           assert torch.version.hip, "not a ROCm build of torch"
@@ -146,7 +174,7 @@ jobs:
           # VMs have 32 GB of host RAM (upstream's MI300 job runs 19).
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
             python -m pytest tests --ignore=tests/distributed -p devlab_sample -q -rf \
-            -p no:cacheprovider -n 4 --timeout=900 --junitxml=junit.xml
+            -p no:cacheprovider -n 4 --max-worker-restart=16 --timeout=900 --junitxml=junit.xml
 
       - name: Write the run summary
         if: always()
