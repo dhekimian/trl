@@ -108,6 +108,7 @@ jobs:
             elif grep -qE ' skipped' "logs/f2-$i.log"; then r=skipped
             else r="other(rc=$rc)"; fi
             echo "F2 run $i: $r" | tee -a results.txt
+            export HF_HUB_OFFLINE=1  # the first run warmed the cache; repeats need no Hub calls
           done
 
       - name: In context - the faulting test among its neighbours
@@ -135,6 +136,7 @@ jobs:
             if grep -qE "^(FAILED|ERROR) .*$CTX_TEST" "logs/f2ctx-$name.log"; then t="$CTX_TEST FAILED"; else t="$CTX_TEST ok"; fi
             echo "context $name: $t; faults: $(grep -cE 'illegal memory access was encountered$' "logs/f2ctx-$name.log"); first: $(grep -m1 -E '^(FAILED|ERROR) ' "logs/f2ctx-$name.log" | cut -c1-120); $(grep -E '[0-9]+ (passed|failed)' "logs/f2ctx-$name.log" | tail -1)" | tee -a results.txt
             grep -m3 -E 'Memory Fault|kernel: ' "logs/f2ctx-$name.log" | cut -c1-300 || true
+            export HF_HUB_OFFLINE=1  # the first run warmed the cache; repeats need no Hub calls
           }
           for i in $(seq "${CTX_SINGLE:-3}"); do run "single-$i" -p no:xdist; done
           for i in $(seq "${CTX_XDIST:-3}"); do run "xdist4-$i" -n 4 --max-worker-restart=16; done
@@ -171,6 +173,7 @@ jobs:
             # Keep the head and tail only: a faulting run logs hundreds of thousands of lines.
             { head -c 300000 "logs/f3-vlm-$i.log"; echo; echo '[...]'; tail -c 300000 "logs/f3-vlm-$i.log"; } > "logs/f3-vlm-$i.trim" \
               && mv "logs/f3-vlm-$i.trim" "logs/f3-vlm-$i.log"
+            export HF_HUB_OFFLINE=1  # the first run warmed the cache; repeats need no Hub calls
           done
 
       - name: Results
