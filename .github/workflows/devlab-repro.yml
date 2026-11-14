@@ -12,7 +12,7 @@ on:
         description: Runs of each test
         default: "10"
       matrix:
-        description: Jobs (JSON list; f2, f2ctx, f3 pick the steps)
+        description: Jobs (JSON list; f2, f3, ctx_file/ctx_test pick the steps)
         default: >-
           [{"name": "rocm7.2", "index": "https://download.pytorch.org/whl/rocm7.2", "f2": true},
           {"name": "rocm10.0", "index": "https://download.pytorch.org/whl/rocm10.0", "f2": true, "f3": true},
@@ -110,12 +110,18 @@ jobs:
             echo "F2 run $i: $r" | tee -a results.txt
           done
 
-      - name: F2 - test_train_padding_free in context
-        if: matrix.f2ctx
+      - name: In context - the faulting test among its neighbours
+        if: matrix.ctx_file
+        env:
+          CTX_FILE: ${{ matrix.ctx_file }}
+          CTX_TEST: ${{ matrix.ctx_test }}
+          CTX_SINGLE: ${{ matrix.ctx_single }}
+          CTX_XDIST: ${{ matrix.ctx_xdist }}
+          CTX_SERIAL: ${{ matrix.ctx_serial }}
         run: |
-          # In isolation the test passes; in the full suite it faults. Run it among the other sampled DPO tests:
-          # a) one process, file order; b) four xdist workers on the one GPU, as in the suite;
-          # c) as (a) with kernels serialized, to name the kernel that faults.
+          # In isolation the test passes; in the full suite it faults. Run it among the other sampled tests of its
+          # file (or the whole sample, ctx_file "tests"): a) one process; b) four xdist workers on the one GPU, as in
+          # the suite; c) as (a) with kernels serialized, to name the kernel that faults.
           . venv/bin/activate
           mkdir -p logs
           export PYTHONPATH="$RUNNER_TEMP/sampler" DEVLAB_PER=40 DEVLAB_GROUP=file
@@ -123,16 +129,16 @@ jobs:
           sed -n '/^          import os$/,/^          PY$/p' .github/workflows/devlab-rocm-test.yml | sed '$d; s/^          //' > "$PYTHONPATH/devlab_sample.py"
           run() {  # name, extra pytest args...
             local name=$1; shift; local rc=0
-            timeout 2400 python -m pytest tests/test_dpo_trainer.py -p devlab_sample -q -rf -p no:cacheprovider \
+            timeout 2400 python -m pytest "$CTX_FILE" --ignore=tests/distributed -p devlab_sample -q -rf -p no:cacheprovider \
               --timeout=600 "$@" > "logs/f2ctx-$name.log" 2>&1 || rc=$?
             local t
-            if grep -qE 'FAILED .*test_train_padding_free|ERROR .*test_train_padding_free' "logs/f2ctx-$name.log"; then t="padding_free FAILED"; else t="padding_free ok"; fi
-            echo "F2 context $name: $t; faults: $(grep -cE 'illegal memory access was encountered$' "logs/f2ctx-$name.log"); first: $(grep -m1 -E '^(FAILED|ERROR) ' "logs/f2ctx-$name.log" | cut -c1-120); $(grep -E '[0-9]+ (passed|failed)' "logs/f2ctx-$name.log" | tail -1)" | tee -a results.txt
+            if grep -qE "^(FAILED|ERROR) .*$CTX_TEST" "logs/f2ctx-$name.log"; then t="$CTX_TEST FAILED"; else t="$CTX_TEST ok"; fi
+            echo "context $name: $t; faults: $(grep -cE 'illegal memory access was encountered$' "logs/f2ctx-$name.log"); first: $(grep -m1 -E '^(FAILED|ERROR) ' "logs/f2ctx-$name.log" | cut -c1-120); $(grep -E '[0-9]+ (passed|failed)' "logs/f2ctx-$name.log" | tail -1)" | tee -a results.txt
             grep -m3 -E 'Memory Fault|kernel: ' "logs/f2ctx-$name.log" | cut -c1-300 || true
           }
-          for i in 1 2 3; do run "single-$i" -p no:xdist; done
-          for i in 1 2 3; do run "xdist4-$i" -n 4; done
-          AMD_SERIALIZE_KERNEL=3 run serialized -p no:xdist
+          for i in $(seq "${CTX_SINGLE:-3}"); do run "single-$i" -p no:xdist; done
+          for i in $(seq "${CTX_XDIST:-3}"); do run "xdist4-$i" -n 4 --max-worker-restart=16; done
+          [ "${CTX_SERIAL:-1}" = 0 ] || AMD_SERIALIZE_KERNEL=3 run serialized -p no:xdist
 
       - name: F3 - standalone GEMM sweep and model scripts
         if: matrix.f3
