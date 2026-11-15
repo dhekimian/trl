@@ -13,4 +13,4 @@ tests/test_async_grpo_trainer.py::TestAsyncGRPOTrainerVLM::test_train_vlm_text_o
 # The test picks kernels-community/aiter-flash-attn@v2 for any ROCm device; with PyTorch's torch 2.14.1+rocm7.2
 # on gfx1201 that kernel faults (illegal memory access) during training. It passes on gfx1151, and on gfx1201
 # with the rocm7.14, rocm10.0, AMD rocm10.1 and rocm-next torch builds.
-tests/test_dpo_trainer.py::TestDPOTrainer::test_train_padding_free | UNPROVEN: illegal memory access on gfx1201 with torch 2.14.1+rocm7.2, only after other test files run in the same session (4/4 full suites, 0/17 isolated); not our setup, faulting kernel not yet isolated | not filed
+tests/test_dpo_trainer.py::TestDPOTrainer::test_train_padding_free | gfx1201 GPU fault from the HIP caching-allocator bug fixed in ROCm 10.1 (gone with PYTORCH_NO_HIP_MEMORY_CACHING=1); strikes whichever test runs | https://github.com/ROCm/rocm-libraries/pull/8909
