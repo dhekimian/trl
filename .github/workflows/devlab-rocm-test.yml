@@ -187,7 +187,8 @@ jobs:
           set -euo pipefail
           . venv/bin/activate
           # Upstream's command (Makefile `test`, tests.yml tests_amd): -n auto --dist loadgroup -s -v, reruns for
-          # transient Hub/OOM errors. Ours adds the deterministic sample, tests/distributed left out (2 GPUs),
+          # transient Hub/OOM errors, except --dist load: loadgroup hangs pytest-xdist 3.8 for good once a worker
+          # crashes, and the only xdist_group in trl (vllm_server) is skipped here (no vllm). Ours adds the deterministic sample, tests/distributed left out (2 GPUs),
           # junit for the judge, a per-test timeout and worker restarts after a GPU fault.
           # Test failures do not fail this step; "Judge results" decides, so a
           # known upstream failure can show as a warning instead.
@@ -197,11 +198,10 @@ jobs:
           # Peak memory, to size PYTEST_XDIST_AUTO_NUM_WORKERS.
           ( peak=0; while sleep 5; do u=$(free -m | awk '/^Mem:/{print $3}'); [ "$u" -gt "$peak" ] && peak=$u && echo "$peak" > mem-peak.txt; done ) &
           mem_pid=$!
-          # Watchdog: with `--dist loadgroup`, pytest-xdist 3.8 hangs for good once a worker crashes (a GPU
-          # fault aborts one). SIGINT after 40 min ends the session and keeps the junit of what ran.
+          # Watchdog: SIGINT after 40 min ends a stuck session and keeps the junit of what ran.
           rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
-            timeout -s INT -k 120 40m python -m pytest -n auto --dist loadgroup -s -v --reruns 5 --reruns-delay 1 \
+            timeout -s INT -k 120 40m python -m pytest -n auto --dist load -s -v --reruns 5 --reruns-delay 1 \
             --only-rerun '(OSError|Timeout|HTTPError.*502|HTTPError.*504|out of memory|STATUS_ALLOC_FAILED)' \
             tests --ignore=tests/distributed -p devlab_sample -rf -p no:cacheprovider \
             --max-worker-restart=16 --timeout=900 --junitxml=junit.xml || rc=$?
