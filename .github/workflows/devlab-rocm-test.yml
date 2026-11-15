@@ -55,16 +55,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # workers: PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (upstream's MI300 job uses 19). Each worker
-          # imports torch + transformers and loads tiny models: about 2.5-3.5 GB resident at peak. The R9700 VMs
-          # have 32 GB of RAM: 6 workers leave ~10 GB for the OS, pip caches and the runner. Strix Halo has 128 GB
-          # shared between CPU and GPU: 8. The "Tests" step logs peak memory so these can be revisited.
+          # workers: PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (upstream's MI300 job uses 19). Measured peak
+          # host memory ("Tests" logs it): R9700 VM, 6 workers: 28.1 of 32 GB, so ~4.7 GB a worker; 5 keeps
+          # ~8 GB free. Strix Halo, 8 workers: 44.6 of 128 GB (unified: GPU memory counts here too); 8 is enough
+          # (the sample takes 5 min).
           - gpu: strix-halo
             gfx: gfx1151
             workers: 8
           - gpu: radeon-r9700
             gfx: gfx1201
-            workers: 6
+            workers: 5
     runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
     timeout-minutes: 90
     env:
